@@ -47,6 +47,37 @@ const ALLOWED_ORIGINS = new Set([
 
 const maxAgent = new https.Agent({ ca: RUSSIAN_TRUSTED_ROOT_CA });
 
+const WINDOW_MS = 10 * 60 * 1000;
+const MAX_PER_IP = 4;
+const recentByIp = new Map();
+const recentPhones = new Map();
+
+function prune(now) {
+  for (const [ip, times] of recentByIp) {
+    const fresh = times.filter((t) => now - t < WINDOW_MS);
+    if (fresh.length) recentByIp.set(ip, fresh);
+    else recentByIp.delete(ip);
+  }
+  for (const [phone, t] of recentPhones) {
+    if (now - t >= WINDOW_MS) recentPhones.delete(phone);
+  }
+}
+
+function spamReason(data, origin, ip, now) {
+  if (!ALLOWED_ORIGINS.has(origin)) return "origin";
+  if (data.hp_x7) return "honeypot";
+  // el отсутствует у тех, кому браузер показал старую версию страницы из кеша — их не режем
+  if (typeof data.el === "number" && data.el < 2500) return "too_fast";
+  const phone = String(data.phone || "").replace(/\D/g, "");
+  if (!/^(?:7|8)\d{10}$/.test(phone) && !/^\d{10}$/.test(phone)) return "phone";
+  if (new Set(phone.slice(-10)).size < 4) return "phone_junk";
+  const name = String(data.name || "");
+  if (name.length > 80 || /https?:|www\.|<|@|\.(ru|com|net|org|io)\b/i.test(name)) return "name";
+  if (recentPhones.has(phone.slice(-10))) return "duplicate";
+  if ((recentByIp.get(ip) || []).length >= MAX_PER_IP) return "rate_limit";
+  return null;
+}
+
 function sendToMax(text) {
   return new Promise((resolve, reject) => {
     const body = JSON.stringify({ text });
@@ -105,6 +136,19 @@ const server = http.createServer((req, res) => {
       return res.end(JSON.stringify({ ok: false, error: "bad_json" }));
     }
 
+    const now = Date.now();
+    prune(now);
+    const ip =
+      String(req.headers["x-forwarded-for"] || "").split(",")[0].trim() ||
+      req.socket.remoteAddress;
+    const reason = spamReason(data, origin, ip, now);
+    if (reason) {
+      console.log("spam blocked:", reason, ip, JSON.stringify(data).slice(0, 300));
+      res.writeHead(200, { "Content-Type": "application/json" });
+      return res.end(JSON.stringify({ ok: true }));
+    }
+    recentByIp.set(ip, [...(recentByIp.get(ip) || []), now]);
+
     const text = [
       "🔔 Новая заявка с сайта savinovplastic.ru",
       "",
@@ -122,6 +166,7 @@ const server = http.createServer((req, res) => {
     try {
       const result = await sendToMax(text);
       const ok = result.status >= 200 && result.status < 300;
+      if (ok) recentPhones.set(String(data.phone).replace(/\D/g, "").slice(-10), now);
       res.writeHead(ok ? 200 : 502, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok, result: result.body }));
     } catch (err) {
