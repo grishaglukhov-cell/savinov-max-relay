@@ -63,9 +63,19 @@ function prune(now) {
   }
 }
 
+function log(...args) {
+  const ts = new Date().toLocaleString("ru-RU", { timeZone: "Europe/Moscow" });
+  console.log("[" + ts + " МСК]", ...args);
+}
+
+// Поле-ловушку иногда заполняет автозаполнение браузера у живых людей
+// (подставляет сохранённое имя), поэтому по нему заявку не режем, а помечаем.
+function honeypotValue(data) {
+  return String(data.hp_x7 || data.hp_z9 || "").trim();
+}
+
 function spamReason(data, origin, ip, now) {
   if (!ALLOWED_ORIGINS.has(origin)) return "origin";
-  if (data.hp_x7) return "honeypot";
   // el отсутствует у тех, кому браузер показал старую версию страницы из кеша — их не режем
   if (typeof data.el === "number" && data.el < 2500) return "too_fast";
   const phone = String(data.phone || "").replace(/\D/g, "");
@@ -143,13 +153,15 @@ const server = http.createServer((req, res) => {
       req.socket.remoteAddress;
     const reason = spamReason(data, origin, ip, now);
     if (reason) {
-      console.log("spam blocked:", reason, ip, JSON.stringify(data).slice(0, 300));
+      log("spam blocked:", reason, ip, JSON.stringify(data).slice(0, 300));
       res.writeHead(200, { "Content-Type": "application/json" });
       return res.end(JSON.stringify({ ok: true }));
     }
     recentByIp.set(ip, [...(recentByIp.get(ip) || []), now]);
 
+    const hp = honeypotValue(data);
     const text = [
+      hp ? "⚠️ Возможно спам: заполнено скрытое поле («" + hp.slice(0, 40) + "»). Часто это автозаполнение браузера — лучше перезвонить." : null,
       "🔔 Новая заявка с сайта savinovplastic.ru",
       "",
       "👤 Имя: " + (data.name || "—"),
@@ -167,9 +179,11 @@ const server = http.createServer((req, res) => {
       const result = await sendToMax(text);
       const ok = result.status >= 200 && result.status < 300;
       if (ok) recentPhones.set(String(data.phone).replace(/\D/g, "").slice(-10), now);
+      log(ok ? "lead sent" + (hp ? " (honeypot)" : "") : "max error " + result.status, ip, JSON.stringify(data).slice(0, 300));
       res.writeHead(ok ? 200 : 502, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok, result: result.body }));
     } catch (err) {
+      log("max error", ip, String(err));
       res.writeHead(502, { "Content-Type": "application/json" });
       res.end(JSON.stringify({ ok: false, error: String(err) }));
     }
